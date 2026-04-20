@@ -3,7 +3,15 @@
     "allow": [
       "Bash(git init *)",
       "Bash(git add *)",
-      "Bash(git commit -m '初始化项目：atop日志分析工具 *)"
+      "Bash(git commit -m '初始化项目：atop日志分析工具 *)",
+      "Bash(./atop-analyze atop_20260419)",
+      "Bash(./atop-20260419095608/atop-analyze atop-20260419095608/atop_20260419)",
+      "Read(//tmp/**)",
+      "Read(//usr/local/go/**)",
+      "Read(//opt/**)",
+      "Bash(pacman -Q go)",
+      "Read(//usr/local/bin/**)",
+      "Bash(git commit -m '修复CPU趋势数据为空问题 *)"
     ]
   }
 }

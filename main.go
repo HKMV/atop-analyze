@@ -504,6 +504,7 @@ type pivotData struct {
 
 // buildPivot scans results and builds pivoted time-series data.
 // mode is "cpu" or "mem". Cumulative snapshots are excluded from trend data.
+// For processes not in Top N at a given time, value is 0 (not missing).
 func buildPivot(results []SampleResult, mode string) pivotData {
 	// Count frequency of each process name
 	freq := map[string]int{}
@@ -553,6 +554,7 @@ func buildPivot(results []SampleResult, mode string) pivotData {
 	}
 
 	// Build pivot rows (only normal samples)
+	// Initialize row with 0 values for all tracked processes
 	var times []time.Time
 	var values []map[string]float64
 	for i, r := range results {
@@ -565,7 +567,14 @@ func buildPivot(results []SampleResult, mode string) pivotData {
 		} else {
 			procs = r.TopMem
 		}
+
+		// Initialize all tracked process values to 0
 		row := map[string]float64{}
+		for _, name := range procNames {
+			row[name] = 0.0
+		}
+
+		// Fill in actual values from Top N
 		for _, p := range procs {
 			if !procSet[p.Name] {
 				continue
@@ -734,15 +743,13 @@ func writeTrendSheet(f *excelize.File, results []SampleResult,
 	lastColName, _ := excelize.ColumnNumberToName(len(pivot.procNames) + 1)
 	f.SetColWidth(sheetName, "B", lastColName, 14)
 
-	// Write data rows
+	// Write data rows (all values are now initialized to 0 if not present)
 	for ri, t := range pivot.times {
 		dataRow := dataStartRow + 1 + ri
 		f.SetCellValue(sheetName, cellName(1, dataRow), t.Format("2006-01-02 15:04:05"))
 		for ci, name := range pivot.procNames {
-			if val, ok := pivot.values[ri][name]; ok {
-				f.SetCellValue(sheetName, cellName(ci+2, dataRow), val)
-			}
-			// leave blank if not in top 3 for this sample
+			val := pivot.values[ri][name] // always exists, may be 0
+			f.SetCellValue(sheetName, cellName(ci+2, dataRow), val)
 		}
 	}
 
