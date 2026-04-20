@@ -127,6 +127,7 @@ type SampleResult struct {
 	Flags    uint16
 	TopCPU   []ProcessInfo
 	TopMem   []ProcessInfo
+	AllProcs []ProcessInfo // All processes in this sample (for trend analysis)
 }
 
 // --- binary read helpers (little-endian) ---
@@ -383,6 +384,7 @@ func main() {
 			Flags:    flags,
 			TopCPU:   topCPU,
 			TopMem:   topMem,
+				AllProcs: processes, // Store all processes for trend analysis
 		})
 	}
 
@@ -504,22 +506,18 @@ type pivotData struct {
 
 // buildPivot scans results and builds pivoted time-series data.
 // mode is "cpu" or "mem". Cumulative snapshots are excluded from trend data.
-// For processes not in Top N at a given time, value is 0 (not missing).
+// For processes not present at a given time, value is 0 (not missing).
+// Uses AllProcs (all processes) instead of just Top N for accurate trends.
 func buildPivot(results []SampleResult, mode string) pivotData {
-	// Count frequency of each process name
+	// Count frequency of each process name across all processes
 	freq := map[string]int{}
 	for i, r := range results {
 		if isCumulative(r, i, len(results)) {
 			continue
 		}
-		var procs []ProcessInfo
-		if mode == "cpu" {
-			procs = r.TopCPU
-		} else {
-			procs = r.TopMem
-		}
+		// Use AllProcs instead of TopCPU/TopMem for comprehensive analysis
 		seen := map[string]bool{}
-		for _, p := range procs {
+		for _, p := range r.AllProcs {
 			if !seen[p.Name] {
 				freq[p.Name]++
 				seen[p.Name] = true
@@ -561,12 +559,6 @@ func buildPivot(results []SampleResult, mode string) pivotData {
 		if isCumulative(r, i, len(results)) {
 			continue
 		}
-		var procs []ProcessInfo
-		if mode == "cpu" {
-			procs = r.TopCPU
-		} else {
-			procs = r.TopMem
-		}
 
 		// Initialize all tracked process values to 0
 		row := map[string]float64{}
@@ -574,8 +566,8 @@ func buildPivot(results []SampleResult, mode string) pivotData {
 			row[name] = 0.0
 		}
 
-		// Fill in actual values from Top N
-		for _, p := range procs {
+		// Fill in actual values from AllProcs
+		for _, p := range r.AllProcs {
 			if !procSet[p.Name] {
 				continue
 			}
@@ -708,11 +700,68 @@ func exportExcel(results []SampleResult, outputPath string) error {
 		return fmt.Errorf("writing memory trend sheet: %w", err)
 	}
 
+	// ---- Sheet 4: 完整进程数据 ----
+	if err := writeFullProcessSheet(f, results, headerStyle); err != nil {
+		return fmt.Errorf("writing full process sheet: %w", err)
+	}
+
 	// Set active sheet to samples
 	idx, _ := f.GetSheetIndex(samplesSheet)
 	f.SetActiveSheet(idx)
 
 	return f.SaveAs(outputPath)
+}
+
+// writeFullProcessSheet writes a sheet containing all process data for each time point
+func writeFullProcessSheet(f *excelize.File, results []SampleResult, headerStyle int) error {
+	const fullSheet = "完整进程数据"
+	f.NewSheet(fullSheet)
+
+	// Write headers
+	headers := []string{
+		"时间", "PID", "进程名", "CPU%", "CPU Ticks",
+		"驻留内存(MB)", "虚拟内存(MB)", "Swap(MB)",
+		"线程数", "状态", "命令行",
+	}
+	for col, h := range headers {
+		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
+		f.SetCellValue(fullSheet, cell, h)
+	}
+	headerEnd, _ := excelize.CoordinatesToCellName(len(headers), 1)
+	f.SetCellStyle(fullSheet, "A1", headerEnd, headerStyle)
+
+	// Column widths
+	colWidths := map[string]float64{
+		"A": 20, "B": 10, "C": 18, "D": 10, "E": 14,
+		"F": 14, "G": 14, "H": 12, "I": 8, "J": 6, "K": 55,
+	}
+	for col, w := range colWidths {
+		f.SetColWidth(fullSheet, col, col, w)
+	}
+
+	// Write data rows (skip cumulative snapshots)
+	row := 2
+	for i, r := range results {
+		if isCumulative(r, i, len(results)) {
+			continue
+		}
+		for _, p := range r.AllProcs {
+			f.SetCellValue(fullSheet, cellName(1, row), r.Time.Format("2006-01-02 15:04:05"))
+			f.SetCellValue(fullSheet, cellName(2, row), p.PID)
+			f.SetCellValue(fullSheet, cellName(3, row), p.Name)
+			f.SetCellValue(fullSheet, cellName(4, row), p.CPUPct)
+			f.SetCellValue(fullSheet, cellName(5, row), p.CPUTicks)
+			f.SetCellValue(fullSheet, cellName(6, row), float64(p.RmemKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(7, row), float64(p.VmemKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(8, row), float64(p.VswapKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(9, row), p.Nthr)
+			f.SetCellValue(fullSheet, cellName(10, row), string(rune(p.State)))
+			f.SetCellValue(fullSheet, cellName(11, row), p.Cmdline)
+			row++
+		}
+	}
+
+	return nil
 }
 
 func writeTrendSheet(f *excelize.File, results []SampleResult,
