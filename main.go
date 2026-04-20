@@ -712,9 +712,11 @@ func exportExcel(results []SampleResult, outputPath string) error {
 	return f.SaveAs(outputPath)
 }
 
-// writeFullProcessSheet writes a sheet containing all process data for each time point
+// writeFullProcessSheet writes a sheet containing top 20 processes per time point
 func writeFullProcessSheet(f *excelize.File, results []SampleResult, headerStyle int) error {
 	const fullSheet = "完整进程数据"
+	const maxProcsPerSample = 20 // Limit to top 20 processes per time point
+
 	f.NewSheet(fullSheet)
 
 	// Write headers
@@ -745,7 +747,19 @@ func writeFullProcessSheet(f *excelize.File, results []SampleResult, headerStyle
 		if isCumulative(r, i, len(results)) {
 			continue
 		}
-		for _, p := range r.AllProcs {
+		// Limit to top 20 processes by CPU usage
+		procs := r.AllProcs
+		if len(procs) > maxProcsPerSample {
+			// Sort by CPU usage and take top 20
+			sorted := make([]ProcessInfo, len(procs))
+			copy(sorted, procs)
+			sort.Slice(sorted, func(i, j int) bool {
+				return sorted[i].CPUTicks > sorted[j].CPUTicks
+			})
+			procs = sorted[:maxProcsPerSample]
+		}
+
+		for _, p := range procs {
 			f.SetCellValue(fullSheet, cellName(1, row), r.Time.Format("2006-01-02 15:04:05"))
 			f.SetCellValue(fullSheet, cellName(2, row), p.PID)
 			f.SetCellValue(fullSheet, cellName(3, row), p.Name)

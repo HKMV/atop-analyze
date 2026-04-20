@@ -14,7 +14,9 @@
       "Bash(git commit -m '修复CPU趋势数据为空问题 *)",
       "Bash(git commit *)",
       "Bash(go build *)",
-      "Bash(./atop-analyze-new atop-20260419095608/atop_20260419)"
+      "Bash(./atop-analyze-new atop-20260419095608/atop_20260419)",
+      "Bash(./atop-analyze-new atop-20260419095608/atop_20260418)",
+      "Bash(ls *)"
     ]
   }
 }
