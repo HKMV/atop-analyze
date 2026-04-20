@@ -11,7 +11,8 @@
       "Read(//opt/**)",
       "Bash(pacman -Q go)",
       "Read(//usr/local/bin/**)",
-      "Bash(git commit -m '修复CPU趋势数据为空问题 *)"
+      "Bash(git commit -m '修复CPU趋势数据为空问题 *)",
+      "Bash(git commit *)"
     ]
   }
 }
