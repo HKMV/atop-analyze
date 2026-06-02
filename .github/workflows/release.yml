@@ -1,0 +1,50 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.22'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build Linux binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o atop-analyze main.go
+
+      - name: Build Windows binary
+        run: |
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o atop-analyze.exe main.go
+
+      - name: Package release assets
+        run: |
+          mkdir -p release
+          tar -czf release/atop-analyze-linux-amd64.tar.gz atop-analyze
+          zip -j release/atop-analyze-windows-amd64.zip atop-analyze.exe
+          ls -lh release
+
+      - name: Create GitHub release and upload assets
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            自动构建并发布 release。
+            
+            生成内容包括：Linux amd64 可执行文件和 Windows amd64 可执行文件。
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
