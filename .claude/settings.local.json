@@ -16,7 +16,12 @@
       "Bash(go build *)",
       "Bash(./atop-analyze-new atop-20260419095608/atop_20260419)",
       "Bash(./atop-analyze-new atop-20260419095608/atop_20260418)",
-      "Bash(ls *)"
+      "Bash(ls *)",
+      "Bash(git checkout *)",
+      "Bash(cat)",
+      "Bash(python3 /tmp/patch.py)",
+      "Bash(python3 /tmp/fix.py)",
+      "Bash(./atop-analyze *)"
     ]
   }
 }

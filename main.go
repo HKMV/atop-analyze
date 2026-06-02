@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,9 @@ const (
 	MAGIC = uint32(0xfeedbeef)
 	TOP_N = 3
 )
+
+// TOP_FULL can be set via command line flag --top
+var TOP_FULL = 20
 
 // ========== rawheader field offsets (from atop rawlog.h) ==========
 // All offsets are for x86_64 Linux, little-endian
@@ -125,9 +129,10 @@ type SampleResult struct {
 	Time     time.Time
 	Interval uint32
 	Flags    uint16
-	TopCPU   []ProcessInfo
-	TopMem   []ProcessInfo
-	AllProcs []ProcessInfo // All processes in this sample (for trend analysis)
+	TopCPU   []ProcessInfo // Top 3 by CPU (for terminal display)
+	TopMem   []ProcessInfo // Top 3 by memory (for terminal display)
+	Top20CPU []ProcessInfo // Top 20 by CPU (for full process sheet & CPU trend)
+	Top20Mem []ProcessInfo // Top 20 by memory (for full process sheet & memory trend)
 }
 
 // --- binary read helpers (little-endian) ---
@@ -191,11 +196,20 @@ func formatMemory(kb int64) string {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <atop_logfile>\n", os.Args[0])
+	// Parse command line arguments
+	var topCount int
+	flag.IntVar(&topCount, "top", 20, "Number of top processes to collect per sample (default: 20)")
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [--top N] <atop_logfile>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  --top N  Number of top processes to collect per sample (default: 20)\n")
 		os.Exit(1)
 	}
-	filename := os.Args[1]
+	filename := flag.Arg(0)
+
+	// Set TOP_FULL dynamically
+	TOP_FULL = topCount
 
 	f, err := os.Open(filename)
 	if err != nil {
@@ -377,6 +391,17 @@ func main() {
 		if len(topMem) > TOP_N {
 			topMem = topMem[:TOP_N]
 		}
+	// Prepare Top20 slices by copying and limiting to TOP_FULL (20)
+	top20CPU := make([]ProcessInfo, len(cpuSorted))
+	copy(top20CPU, cpuSorted)
+	if len(top20CPU) > TOP_FULL {
+		top20CPU = top20CPU[:TOP_FULL]
+	}
+	top20Mem := make([]ProcessInfo, len(memSorted))
+	copy(top20Mem, memSorted)
+	if len(top20Mem) > TOP_FULL {
+		top20Mem = top20Mem[:TOP_FULL]
+	}
 
 		results = append(results, SampleResult{
 			Time:     t,
@@ -384,7 +409,8 @@ func main() {
 			Flags:    flags,
 			TopCPU:   topCPU,
 			TopMem:   topMem,
-				AllProcs: processes, // Store all processes for trend analysis
+				Top20CPU: top20CPU,
+		Top20Mem: top20Mem,
 		})
 	}
 
@@ -507,17 +533,28 @@ type pivotData struct {
 // buildPivot scans results and builds pivoted time-series data.
 // mode is "cpu" or "mem". Cumulative snapshots are excluded from trend data.
 // For processes not present at a given time, value is 0 (not missing).
-// Uses AllProcs (all processes) instead of just Top N for accurate trends.
+// CPU趋势使用Top20CPU数据，内存趋势使用Top20Mem数据。
 func buildPivot(results []SampleResult, mode string) pivotData {
+	// Choose source based on mode
+	var sourceProcs [][]ProcessInfo
+	for _, r := range results {
+		if mode == "cpu" {
+			sourceProcs = append(sourceProcs, r.Top20CPU)
+		} else {
+			sourceProcs = append(sourceProcs, r.Top20Mem)
+		}
+	}
+
 	// Count frequency of each process name across all processes
 	freq := map[string]int{}
 	for i, r := range results {
 		if isCumulative(r, i, len(results)) {
 			continue
 		}
-		// Use AllProcs instead of TopCPU/TopMem for comprehensive analysis
+		// Use the appropriate Top20 list for counting
 		seen := map[string]bool{}
-		for _, p := range r.AllProcs {
+		src := sourceProcs[i]
+		for _, p := range src {
 			if !seen[p.Name] {
 				freq[p.Name]++
 				seen[p.Name] = true
@@ -566,8 +603,9 @@ func buildPivot(results []SampleResult, mode string) pivotData {
 			row[name] = 0.0
 		}
 
-		// Fill in actual values from AllProcs
-		for _, p := range r.AllProcs {
+		// Fill in actual values from appropriate Top20 list
+		src := sourceProcs[i]
+		for _, p := range src {
 			if !procSet[p.Name] {
 				continue
 			}
@@ -590,6 +628,9 @@ func exportExcel(results []SampleResult, outputPath string) error {
 	f := excelize.NewFile()
 	defer f.Close()
 
+	// Rename the default Sheet1 to "完整进程数据"
+	f.SetSheetName("Sheet1", "完整进程数据")
+
 	// ---- Define styles ----
 	headerStyle, _ := f.NewStyle(&excelize.Style{
 		Font:      &excelize.Font{Bold: true, Color: "#FFFFFF", Size: 11},
@@ -599,93 +640,10 @@ func exportExcel(results []SampleResult, outputPath string) error {
 			{Type: "bottom", Color: "#2F5496", Style: 1},
 		},
 	})
-	snapshotStyle, _ := f.NewStyle(&excelize.Style{
-		Fill: excelize.Fill{Type: "pattern", Color: []string{"#FFF2CC"}, Pattern: 1},
-	})
-	evenRowStyle, _ := f.NewStyle(&excelize.Style{
-		Fill: excelize.Fill{Type: "pattern", Color: []string{"#D6E4F0"}, Pattern: 1},
-	})
 
-	// ---- Sheet 1: 采样数据 ----
-	const samplesSheet = "采样数据"
-	f.SetSheetName("Sheet1", samplesSheet)
-
-	headers := []string{
-		"采样序号", "时间", "间隔(s)", "类型", "分类", "排名",
-		"PID", "进程名", "CPU%", "CPU Ticks",
-		"驻留内存(MB)", "虚拟内存(MB)", "Swap(MB)",
-		"线程数", "状态", "命令行",
-	}
-	for col, h := range headers {
-		cell, _ := excelize.CoordinatesToCellName(col+1, 1)
-		f.SetCellValue(samplesSheet, cell, h)
-	}
-	headerEnd, _ := excelize.CoordinatesToCellName(len(headers), 1)
-	f.SetCellStyle(samplesSheet, "A1", headerEnd, headerStyle)
-
-	// Column widths
-	colWidths := map[string]float64{
-		"A": 10, "B": 20, "C": 10, "D": 12, "E": 8, "F": 6,
-		"G": 10, "H": 18, "I": 10, "J": 14,
-		"K": 14, "L": 14, "M": 12,
-		"N": 8, "O": 6, "P": 55,
-	}
-	for col, w := range colWidths {
-		f.SetColWidth(samplesSheet, col, col, w)
-	}
-
-	row := 2
-	total := len(results)
-	for i, r := range results {
-		cumul := isCumulative(r, i, total)
-		typeLabel := sampleTypeLabel(r, i, total)
-
-		writeRow := func(category string, rank int, p *ProcessInfo) {
-			cell := func(c int) string {
-				s, _ := excelize.CoordinatesToCellName(c, row)
-				return s
-			}
-			f.SetCellValue(samplesSheet, cell(1), i+1)
-			f.SetCellValue(samplesSheet, cell(2), r.Time.Format("2006-01-02 15:04:05"))
-			f.SetCellValue(samplesSheet, cell(3), r.Interval)
-			f.SetCellValue(samplesSheet, cell(4), typeLabel)
-			f.SetCellValue(samplesSheet, cell(5), category)
-			f.SetCellValue(samplesSheet, cell(6), rank)
-			if p != nil {
-				f.SetCellValue(samplesSheet, cell(7), p.PID)
-				f.SetCellValue(samplesSheet, cell(8), p.Name)
-				f.SetCellValue(samplesSheet, cell(9), p.CPUPct)
-				f.SetCellValue(samplesSheet, cell(10), p.CPUTicks)
-				f.SetCellValue(samplesSheet, cell(11), float64(p.RmemKB)/1024.0)
-				f.SetCellValue(samplesSheet, cell(12), float64(p.VmemKB)/1024.0)
-				f.SetCellValue(samplesSheet, cell(13), float64(p.VswapKB)/1024.0)
-				f.SetCellValue(samplesSheet, cell(14), p.Nthr)
-				f.SetCellValue(samplesSheet, cell(15), string(rune(p.State)))
-				f.SetCellValue(samplesSheet, cell(16), p.Cmdline)
-			}
-
-			// Apply row style
-			rowStart := cell(1)
-			rowEnd := cell(len(headers))
-			if cumul {
-				f.SetCellStyle(samplesSheet, rowStart, rowEnd, snapshotStyle)
-			} else if row%2 == 0 {
-				f.SetCellStyle(samplesSheet, rowStart, rowEnd, evenRowStyle)
-			}
-			row++
-		}
-
-		for rank, p := range r.TopCPU {
-			pp := p
-			writeRow("CPU", rank+1, &pp)
-		}
-		for rank, p := range r.TopMem {
-			pp := p
-			writeRow("内存", rank+1, &pp)
-		}
-		if len(r.TopCPU) == 0 && len(r.TopMem) == 0 {
-			writeRow("-", 0, nil)
-		}
+	// ---- Sheet 1: 完整进程数据 (合并CPU和内存Top数据) ----
+	if err := writeFullProcessSheet(f, results, headerStyle); err != nil {
+		return fmt.Errorf("writing full process sheet: %w", err)
 	}
 
 	// ---- Sheet 2: CPU趋势 ----
@@ -700,28 +658,24 @@ func exportExcel(results []SampleResult, outputPath string) error {
 		return fmt.Errorf("writing memory trend sheet: %w", err)
 	}
 
-	// ---- Sheet 4: 完整进程数据 ----
-	if err := writeFullProcessSheet(f, results, headerStyle); err != nil {
-		return fmt.Errorf("writing full process sheet: %w", err)
-	}
-
-	// Set active sheet to samples
-	idx, _ := f.GetSheetIndex(samplesSheet)
+	// Set active sheet to 完整进程数据
+	idx, _ := f.GetSheetIndex("完整进程数据")
 	f.SetActiveSheet(idx)
 
 	return f.SaveAs(outputPath)
 }
 
-// writeFullProcessSheet writes a sheet containing top 20 processes per time point
+// writeFullProcessSheet writes a sheet containing both CPU and Memory top processes
 func writeFullProcessSheet(f *excelize.File, results []SampleResult, headerStyle int) error {
 	const fullSheet = "完整进程数据"
-	const maxProcsPerSample = 20 // Limit to top 20 processes per time point
 
-	f.NewSheet(fullSheet)
+	// Create sheet
+	// Note: Since we renamed Sheet1 to "完整进程数据", we just use that existing sheet
+	// No need to create a new one
 
 	// Write headers
 	headers := []string{
-		"时间", "PID", "进程名", "CPU%", "CPU Ticks",
+		"时间", "分类", "PID", "进程名", "CPU%", "CPU Ticks",
 		"驻留内存(MB)", "虚拟内存(MB)", "Swap(MB)",
 		"线程数", "状态", "命令行",
 	}
@@ -734,8 +688,8 @@ func writeFullProcessSheet(f *excelize.File, results []SampleResult, headerStyle
 
 	// Column widths
 	colWidths := map[string]float64{
-		"A": 20, "B": 10, "C": 18, "D": 10, "E": 14,
-		"F": 14, "G": 14, "H": 12, "I": 8, "J": 6, "K": 55,
+		"A": 20, "B": 10, "C": 10, "D": 18, "E": 10, "F": 14,
+		"G": 14, "H": 14, "I": 12, "J": 8, "K": 6, "L": 55,
 	}
 	for col, w := range colWidths {
 		f.SetColWidth(fullSheet, col, col, w)
@@ -743,34 +697,44 @@ func writeFullProcessSheet(f *excelize.File, results []SampleResult, headerStyle
 
 	// Write data rows (skip cumulative snapshots)
 	row := 2
+
 	for i, r := range results {
 		if isCumulative(r, i, len(results)) {
 			continue
 		}
-		// Limit to top 20 processes by CPU usage
-		procs := r.AllProcs
-		if len(procs) > maxProcsPerSample {
-			// Sort by CPU usage and take top 20
-			sorted := make([]ProcessInfo, len(procs))
-			copy(sorted, procs)
-			sort.Slice(sorted, func(i, j int) bool {
-				return sorted[i].CPUTicks > sorted[j].CPUTicks
-			})
-			procs = sorted[:maxProcsPerSample]
+		timeStr := r.Time.Format("2006-01-02 15:04:05")
+
+		// Write CPU Top data
+		for _, p := range r.Top20CPU {
+			f.SetCellValue(fullSheet, cellName(1, row), timeStr)
+			f.SetCellValue(fullSheet, cellName(2, row), "CPU")
+			f.SetCellValue(fullSheet, cellName(3, row), p.PID)
+			f.SetCellValue(fullSheet, cellName(4, row), p.Name)
+			f.SetCellValue(fullSheet, cellName(5, row), p.CPUPct)
+			f.SetCellValue(fullSheet, cellName(6, row), p.CPUTicks)
+			f.SetCellValue(fullSheet, cellName(7, row), float64(p.RmemKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(8, row), float64(p.VmemKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(9, row), float64(p.VswapKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(10, row), p.Nthr)
+			f.SetCellValue(fullSheet, cellName(11, row), string(rune(p.State)))
+			f.SetCellValue(fullSheet, cellName(12, row), p.Cmdline)
+			row++
 		}
 
-		for _, p := range procs {
-			f.SetCellValue(fullSheet, cellName(1, row), r.Time.Format("2006-01-02 15:04:05"))
-			f.SetCellValue(fullSheet, cellName(2, row), p.PID)
-			f.SetCellValue(fullSheet, cellName(3, row), p.Name)
-			f.SetCellValue(fullSheet, cellName(4, row), p.CPUPct)
-			f.SetCellValue(fullSheet, cellName(5, row), p.CPUTicks)
-			f.SetCellValue(fullSheet, cellName(6, row), float64(p.RmemKB)/1024.0)
-			f.SetCellValue(fullSheet, cellName(7, row), float64(p.VmemKB)/1024.0)
-			f.SetCellValue(fullSheet, cellName(8, row), float64(p.VswapKB)/1024.0)
-			f.SetCellValue(fullSheet, cellName(9, row), p.Nthr)
-			f.SetCellValue(fullSheet, cellName(10, row), string(rune(p.State)))
-			f.SetCellValue(fullSheet, cellName(11, row), p.Cmdline)
+		// Write Memory Top data
+		for _, p := range r.Top20Mem {
+			f.SetCellValue(fullSheet, cellName(1, row), timeStr)
+			f.SetCellValue(fullSheet, cellName(2, row), "内存")
+			f.SetCellValue(fullSheet, cellName(3, row), p.PID)
+			f.SetCellValue(fullSheet, cellName(4, row), p.Name)
+			f.SetCellValue(fullSheet, cellName(5, row), p.CPUPct)
+			f.SetCellValue(fullSheet, cellName(6, row), p.CPUTicks)
+			f.SetCellValue(fullSheet, cellName(7, row), float64(p.RmemKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(8, row), float64(p.VmemKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(9, row), float64(p.VswapKB)/1024.0)
+			f.SetCellValue(fullSheet, cellName(10, row), p.Nthr)
+			f.SetCellValue(fullSheet, cellName(11, row), string(rune(p.State)))
+			f.SetCellValue(fullSheet, cellName(12, row), p.Cmdline)
 			row++
 		}
 	}
